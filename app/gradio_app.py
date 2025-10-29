@@ -14,6 +14,7 @@ from app.api import hide_file_in_image, extract_file_from_image
 from metrics.analysis import compute_metrics, dct_magnitude, wht2, chi_square_lsb
 from app.overlays import to_image, tile_hotspots, lsb_parity_heatmap, top_energy_tiles, annotate_boxes
 import matplotlib.pyplot as plt
+from stego.lsb import capacity_bytes
 
 
 def diff_amp_image(cover_img: Image.Image, stego_img: Image.Image, scale: int = 16) -> Image.Image:
@@ -103,6 +104,14 @@ def encode_ui(cover_img: Image.Image, payload_path, password: str, keyed: bool, 
     except Exception as ex:
         return None, None, None, None, f"Error loading payload: {ex}"
 
+    # Capacity check to avoid long-running failures
+    try:
+        cap = capacity_bytes(cover_img)
+        if len(payload_bytes) > cap:
+            return None, None, None, None, f"Error: Payload ({len(payload_bytes):,} B) exceeds capacity (~{cap:,} B)."
+    except Exception:
+        pass
+
     try:
         stego_bytes = hide_file_in_image(
             cover_img_bytes=cover_bytes,
@@ -114,22 +123,39 @@ def encode_ui(cover_img: Image.Image, payload_path, password: str, keyed: bool, 
             encrypt=encrypt,
             out_format=fmt,
         )
-        stego_img = Image.open(BytesIO(stego_bytes)).convert("RGB")
-        diff_amp = np.array(diff_amp_image(cover_img, stego_img))
-        blink_path = make_blink_gif_path(cover_img, stego_img)
-        hotspots = tile_hotspots(stego_img, diff_amp, grid=16, top_k=8)
-        lsb_heat = lsb_parity_heatmap(stego_img)
+        # Try to build preview; if Pillow lacks codec, skip preview
+        stego_img = None
+        diff_amp = None
+        blink_path = None
+        hotspots = None
+        lsb_heat = None
+        try:
+            preview = Image.open(BytesIO(stego_bytes)).convert("RGB")
+            stego_img = preview
+            diff_amp = np.array(diff_amp_image(cover_img, preview))
+            blink_path = make_blink_gif_path(cover_img, preview)
+            hotspots = tile_hotspots(preview, diff_amp, grid=16, top_k=8)
+            lsb_heat = lsb_parity_heatmap(preview)
+        except Exception:
+            pass
 
-        mtxt = metrics_text(cover_img, stego_img)
+        mtxt = metrics_text(cover_img, stego_img) if stego_img is not None else "Saved stego. Preview unavailable on this system."
+
+        # Save exact stego bytes to a temp file for download (respects chosen format)
+        suffix = ".png" if fmt.upper() == "PNG" else ".webp"
+        tmp_out = NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp_out.write(stego_bytes)
+        tmp_out.flush(); tmp_out.close()
+        stego_file_path = tmp_out.name
 
         hints = (
             "Highlighted red boxes: tiles with highest Cover→Stego differences.\n"
             "LSB heatmap: brighter = more 1-bits on average; uniformity shifts can indicate embedding."
         )
 
-        return stego_img, to_image(diff_amp), blink_path, mtxt, "Success", hotspots, lsb_heat, hints
+        return stego_img, to_image(diff_amp), blink_path, mtxt, stego_file_path, "Success", hotspots, lsb_heat, hints
     except Exception as e:
-        return None, None, None, None, f"Error: {e}", None, None, None
+        return None, None, None, None, None, f"Error: {e}", None, None, None
 
 
 def decode_ui(stego_img: Image.Image, password: str, invert_hint: bool, keyed_hint: bool):
@@ -146,9 +172,29 @@ def decode_ui(stego_img: Image.Image, password: str, invert_hint: bool, keyed_hi
 with gr.Blocks(title="Stego Visual UI") as demo:
     gr.Markdown("# 🛡️ Visual Steganography — LSB + AES-GCM")
     with gr.Tab("Encode"):
-        with gr.Row():
-            cover_in = gr.Image(type="pil", image_mode="RGB", sources=["upload"], label="Cover image (lossless recommended)")
-            payload_in = gr.File(label="Payload file", type="filepath")
+    with gr.Row():
+    cover_in = gr.Image(type="pil", image_mode="RGB", sources=["upload"], label="Cover image (lossless recommended)")
+    payload_in = gr.File(label="Payload file", type="filepath")
+
+# 🧩 Add payload preview right below
+def preview_payload(file):
+    import pathlib
+    from PIL import Image
+    if not file:
+        return None, "No file selected."
+    try:
+        path = pathlib.Path(str(file))
+        if path.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"]:
+            img = Image.open(path)
+            return img, f"Image payload: {path.name} ({img.width}×{img.height})"
+        else:
+            text_sample = path.read_text(errors="ignore")[:300]
+            return None, f"Text payload preview ({path.name}):\n{text_sample}..."
+    except Exception as e:
+        return None, f"Cannot preview: {e}"
+
+payload_preview, payload_info = gr.Image(label="Payload preview", visible=True), gr.Markdown()
+payload_in.change(preview_payload, [payload_in], [payload_preview, payload_info])
         with gr.Row():
             password = gr.Textbox(type="password", label="Password (for keyed/encrypt)")
             keyed = gr.Checkbox(label="Keyed order", value=False)
@@ -160,6 +206,7 @@ with gr.Blocks(title="Stego Visual UI") as demo:
             stego_out = gr.Image(type="pil", label="Stego")
             diff_out = gr.Image(type="pil", label="Diff ×16")
             blink_out = gr.Image(label="Blink (Cover↔Stego)")
+        stego_file = gr.File(label="Download stego (exact bytes)")
         with gr.Row():
             hot_out = gr.Image(type="pil", label="Hotspots (highest differences)")
             lsb_out = gr.Image(type="pil", label="LSB Parity Heatmap")
@@ -169,20 +216,109 @@ with gr.Blocks(title="Stego Visual UI") as demo:
         btn.click(
             encode_ui,
             [cover_in, payload_in, password, keyed, inverted, encrypt, fmt],
-            [stego_out, diff_out, blink_out, metrics, status, hot_out, lsb_out, hints],
+            [stego_out, diff_out, blink_out, metrics, stego_file, status, hot_out, lsb_out, hints],
         )
 
     with gr.Tab("Decode"):
-        stego_in = gr.Image(type="pil", image_mode="RGB", sources=["upload"], label="Stego image")
+        stego_path = gr.File(label="Stego image", type="filepath")
         with gr.Row():
             password2 = gr.Textbox(type="password", label="Password (if keyed/encrypted)")
             invert_hint = gr.Checkbox(label="Inverted LSB?", value=False)
             keyed_hint = gr.Checkbox(label="Keyed order?", value=False)
-        btn2 = gr.Button("🧠 Extract File")
+        with gr.Row():
+            btn_diag = gr.Button("🔎 Diagnose Header")
+            btn2 = gr.Button("🧠 Extract File")
         out_name = gr.Textbox(label="Filename", interactive=False)
         out_bytes = gr.File(label="Extracted file", interactive=False)
         status2 = gr.Markdown()
-        btn2.click(decode_ui, [stego_in, password2, invert_hint, keyed_hint], [out_name, out_bytes, status2])
+        header_info = gr.Textbox(label="Header Info", interactive=False)
+
+        def decode_ui2(stego_file_path, password: str, invert_hint: bool, keyed_hint: bool):
+            if stego_file_path is None:
+                return None, None, "Please upload a stego image file."
+            try:
+                import pathlib
+                raw_bytes = pathlib.Path(str(stego_file_path)).read_bytes()
+            except Exception as e:
+                return None, None, f"Error reading file: {e}"
+
+            # Helper to write payload to a temp file for reliable download
+            def _to_temp_file(filename: str, data: bytes) -> str:
+                import os
+                suffix = ("_" + filename) if filename else "_output.bin"
+                tmp = NamedTemporaryFile(suffix="_" + filename if filename else "_output.bin", delete=False)
+                tmp.write(data); tmp.flush(); tmp.close()
+                return tmp.name
+
+            # Primary attempt
+            try:
+                fname, payload = extract_file_from_image(
+                    raw_bytes,
+                    password=password if (keyed_hint or password) else None,
+                    invert_hint=invert_hint,
+                    keyed_hint=keyed_hint,
+                )
+                return fname, _to_temp_file(fname, payload), "Success"
+            except Exception as e1:
+                msg = str(e1)
+                # Helpful guidance for common errors
+                if "InvalidTag" in msg or "MAC check failed" in msg:
+                    return None, None, "Error: Wrong password or corrupted encrypted payload."
+                # Fallback attempts on any failure: try flipped inverted and toggled keyed combos
+                alt_attempts = []
+                alt_attempts.append((not invert_hint, keyed_hint))
+                if password:
+                    alt_attempts.append((invert_hint, not keyed_hint))
+                    alt_attempts.append((not invert_hint, not keyed_hint))
+                    alt_attempts.append((invert_hint, True))
+                    alt_attempts.append((not invert_hint, True))
+                for inv_alt, key_alt in alt_attempts:
+                    try:
+                        fname, payload = extract_file_from_image(
+                            raw_bytes,
+                            password=password if password else None,
+                            invert_hint=inv_alt,
+                            keyed_hint=key_alt,
+                        )
+                        note = " (auto-detected settings used)"
+                        return fname, _to_temp_file(fname, payload), f"Success{note}"
+                    except Exception:
+                        continue
+                return None, None, f"Error: {msg}"
+
+        btn2.click(decode_ui2, [stego_path, password2, invert_hint, keyed_hint], [out_name, out_bytes, status2])
+
+        # Diagnose header: read only the header fields without requiring exact keyed/inverted hints
+        def diagnose_header(stego_file_path):
+            if stego_file_path is None:
+                return "Upload a stego image file first."
+            try:
+                import pathlib
+                raw_bytes = pathlib.Path(str(stego_file_path)).read_bytes()
+            except Exception as e:
+                return f"Error reading file: {e}"
+            try:
+                # Header is written sequentially; hints don't matter for header parsing
+                from stego.lsb import decode_lsb
+                info, _ = decode_lsb(raw_bytes, inverted_hint=False, keyed=False, key_material=None)
+                salt_hex = info['salt'].hex() if info.get('salt') else '(none)'
+                iters = info.get('iters')
+                enc = info.get('encrypted')
+                plen = info.get('length')
+                fn = info.get('filename')
+                return (
+                    f"Header OK.\n"
+                    f"Encrypted: {enc}\n"
+                    f"Filename: {fn}\n"
+                    f"Length: {plen if plen is not None else 'unknown'} bytes\n"
+                    f"Salt: {salt_hex}\n"
+                    f"Iterations: {iters if iters is not None else 'unknown'}\n"
+                    f"Hints: If decoding fails, try toggling Inverted/Keyed and ensure the same password."
+                )
+            except Exception as e:
+                return f"No header found or corrupted: {e}"
+
+        btn_diag.click(diagnose_header, [stego_path], [header_info])
 
     # ---------------- Quality & Stego Test ----------------
     with gr.Tab("Quality & Stego Test"):
@@ -261,5 +397,4 @@ with gr.Blocks(title="Stego Visual UI") as demo:
 
 if __name__ == "__main__":
     demo.launch()
-
 
