@@ -41,6 +41,22 @@ def make_blink_gif_path(cover: Image.Image, stego: Image.Image, duration_ms: int
 def read_file_bytes_from_path(path_or_str) -> tuple[str, bytes]:
     p = pathlib.Path(str(path_or_str))
     return p.name, p.read_bytes()
+# Normalize gr.File input which can be a str path or a dict in some versions
+def _normalize_file_input(v) -> Optional[str]:
+    try:
+        if v is None:
+            return None
+        # Already a path-like
+        if isinstance(v, (str, pathlib.Path)):
+            return str(v)
+        # Gradio may return a dict with 'name'
+        if isinstance(v, dict):
+            name = v.get('name') or v.get('path') or v.get('file')
+            return str(name) if name else None
+    except Exception:
+        pass
+    return None
+
 
 
 # ---------------- Annotation helpers ----------------
@@ -153,7 +169,8 @@ def encode_ui(cover_img: Image.Image, payload_path, password: str, keyed: bool, 
             "LSB heatmap: brighter = more 1-bits on average; uniformity shifts can indicate embedding."
         )
 
-        return stego_img, to_image(diff_amp), blink_path, mtxt, stego_file_path, "Success", hotspots, lsb_heat, hints
+        diff_img = to_image(diff_amp) if diff_amp is not None else None
+        return stego_img, diff_img, blink_path, mtxt, stego_file_path, "Success", hotspots, lsb_heat, hints
     except Exception as e:
         return None, None, None, None, None, f"Error: {e}", None, None, None
 
@@ -172,85 +189,112 @@ def decode_ui(stego_img: Image.Image, password: str, invert_hint: bool, keyed_hi
 with gr.Blocks(title="Stego Visual UI") as demo:
     gr.Markdown("# 🛡️ Visual Steganography — LSB + AES-GCM")
     with gr.Tab("Encode"):
-    with gr.Row():
-    cover_in = gr.Image(type="pil", image_mode="RGB", sources=["upload"], label="Cover image (lossless recommended)")
-    payload_in = gr.File(label="Payload file", type="filepath")
-
-# 🧩 Add payload preview right below
-def preview_payload(file):
-    import pathlib
-    from PIL import Image
-    if not file:
-        return None, "No file selected."
-    try:
-        path = pathlib.Path(str(file))
-        if path.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"]:
-            img = Image.open(path)
-            return img, f"Image payload: {path.name} ({img.width}×{img.height})"
-        else:
-            text_sample = path.read_text(errors="ignore")[:300]
-            return None, f"Text payload preview ({path.name}):\n{text_sample}..."
-    except Exception as e:
-        return None, f"Cannot preview: {e}"
-
-payload_preview, payload_info = gr.Image(label="Payload preview", visible=True), gr.Markdown()
-payload_in.change(preview_payload, [payload_in], [payload_preview, payload_info])
         with gr.Row():
-            password = gr.Textbox(type="password", label="Password (for keyed/encrypt)")
-            keyed = gr.Checkbox(label="Keyed order", value=False)
-            inverted = gr.Checkbox(label="Inverted LSB", value=False)
-            encrypt = gr.Checkbox(label="Encrypt (AES-256-GCM)", value=False)
-            fmt = gr.Radio(["PNG", "WEBP"], value="PNG", label="Output format")
-        btn = gr.Button("🔐 Hide File")
+            cover_in = gr.Image(type="pil", image_mode="RGB", sources=["upload"], label="Cover image (lossless recommended)", elem_classes="cover-image")
+            with gr.Column():
+                payload_in = gr.File(label="Payload file", type="filepath", elem_classes="payload-file")
+                payload_file_preview = gr.Image(label="Payload Preview", visible=False, elem_classes="sm-image")
         with gr.Row():
-            stego_out = gr.Image(type="pil", label="Stego")
-            diff_out = gr.Image(type="pil", label="Diff ×16")
-            blink_out = gr.Image(label="Blink (Cover↔Stego)")
-        stego_file = gr.File(label="Download stego (exact bytes)")
+            password = gr.Textbox(type="password", label="Password (for keyed/encrypt)", elem_classes="sm-textbox")
+            keyed = gr.Checkbox(label="Keyed order", value=False, elem_classes="sm-checkbox")
+            inverted = gr.Checkbox(label="Inverted LSB", value=False, elem_classes="sm-checkbox")
+            encrypt = gr.Checkbox(label="Encrypt (AES-256-GCM)", value=False, elem_classes="sm-checkbox")
+            fmt = gr.Radio(["PNG", "WEBP"], value="PNG", label="Output format", elem_classes="sm-radio")
+        btn = gr.Button("🔐 Hide File", elem_classes="sm-button")
         with gr.Row():
-            hot_out = gr.Image(type="pil", label="Hotspots (highest differences)")
-            lsb_out = gr.Image(type="pil", label="LSB Parity Heatmap")
-        hints = gr.Textbox(label="Highlights", interactive=False)
-        metrics = gr.Textbox(label="Metrics", interactive=False)
+            stego_out = gr.Image(type="pil", label="Stego", elem_classes="sm-image")
+            diff_out = gr.Image(type="pil", label="Diff ×16", elem_classes="sm-image")
+            blink_out = gr.Image(label="Blink (Cover↔Stego)", elem_classes="sm-image")
+        stego_file = gr.File(label="Download stego (exact bytes)", elem_classes="sm-file")
+        with gr.Row():
+            hot_out = gr.Image(type="pil", label="Hotspots (highest differences)", elem_classes="sm-image")
+            lsb_out = gr.Image(type="pil", label="LSB Parity Heatmap", elem_classes="sm-image")
+        # Preview extracted payload as image if possible (for download stego, not upload)
+        payload_preview = gr.Image(label="Payload Preview", visible=False, elem_classes="sm-image")
+        hints = gr.Markdown(elem_classes="sm-md")
+        metrics = gr.Markdown(elem_classes="sm-md")
         status = gr.Markdown()
+
+        # Update encode_ui return/output to include payload_preview if appropriate
+        def encode_ui_payload_preview_wrap(*args):
+            out = encode_ui(*args)
+            stego_img, diff_img, blink, mtxt, stego_file_path, status_msg, hotspots, lsb_map, hints_ = out
+            # Update preview if the payload is image
+            preview_img = None
+            payload_path = args[1]
+            try:
+                fname = str(payload_path)
+                import os
+                from PIL import Image
+                img_exts = [".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"]
+                if fname and any(fname.lower().endswith(e) for e in img_exts):
+                    img = Image.open(fname)
+                    preview_img = img
+            except Exception:
+                preview_img = None
+            return stego_img, diff_img, blink, mtxt, stego_file_path, status_msg, hotspots, lsb_map, hints_, preview_img
+
         btn.click(
-            encode_ui,
+            encode_ui_payload_preview_wrap,
             [cover_in, payload_in, password, keyed, inverted, encrypt, fmt],
-            [stego_out, diff_out, blink_out, metrics, stego_file, status, hot_out, lsb_out, hints],
+            [stego_out, diff_out, blink_out, metrics, stego_file, status, hot_out, lsb_out, hints, payload_preview],
         )
+        payload_preview.change(lambda x: gr.update(visible=bool(x)), inputs=payload_preview, outputs=payload_preview)
+
+        # Show payload file thumbnail when uploading (if image)
+        def payload_file_preview_fn(payload_path):
+            try:
+                fname = str(payload_path)
+                img_exts = [".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"]
+                if fname and any(fname.lower().endswith(e) for e in img_exts):
+                    from PIL import Image
+                    img = Image.open(fname)
+                    return img
+            except Exception:
+                pass
+            return None
+        payload_in.change(payload_file_preview_fn, inputs=payload_in, outputs=payload_file_preview)
+        payload_file_preview.change(lambda x: gr.update(visible=bool(x)), inputs=payload_file_preview, outputs=payload_file_preview)
 
     with gr.Tab("Decode"):
-        stego_path = gr.File(label="Stego image", type="filepath")
         with gr.Row():
-            password2 = gr.Textbox(type="password", label="Password (if keyed/encrypted)")
-            invert_hint = gr.Checkbox(label="Inverted LSB?", value=False)
-            keyed_hint = gr.Checkbox(label="Keyed order?", value=False)
+            with gr.Column():
+                stego_path = gr.File(label="Stego image", type="filepath", elem_classes="sm-file")
+                stego_file_preview = gr.Image(label="Stego Preview", visible=False, elem_classes="sm-image")
+            with gr.Column():
+                pass # leave for symmetry
         with gr.Row():
-            btn_diag = gr.Button("🔎 Diagnose Header")
-            btn2 = gr.Button("🧠 Extract File")
-        out_name = gr.Textbox(label="Filename", interactive=False)
-        out_bytes = gr.File(label="Extracted file", interactive=False)
-        status2 = gr.Markdown()
-        header_info = gr.Textbox(label="Header Info", interactive=False)
+            password2 = gr.Textbox(type="password", label="Password (if keyed/encrypted)", elem_classes="sm-textbox")
+            invert_hint = gr.Checkbox(label="Inverted LSB?", value=False, elem_classes="sm-checkbox")
+            keyed_hint = gr.Checkbox(label="Keyed order?", value=False, elem_classes="sm-checkbox")
 
+        with gr.Row():
+            btn_diag = gr.Button("🔎 Diagnose Header", elem_classes="sm-button")
+            btn2 = gr.Button("🧠 Extract File", elem_classes="sm-button")
+
+        out_name = gr.Textbox(label="Filename", interactive=False, elem_classes="sm-textbox")
+        with gr.Row():
+            out_bytes = gr.File(label="Extracted file", interactive=False, elem_classes="sm-file")
+            extracted_file_preview = gr.Image(label="Extracted Preview", visible=False, elem_classes="sm-image")
+        decode_payload_preview = gr.Image(label="Payload Preview", visible=False, elem_classes="sm-image")
+        status2 = gr.Markdown()
+        header_info = gr.Markdown(elem_classes="sm-md")
+
+        # Helper function for decode
         def decode_ui2(stego_file_path, password: str, invert_hint: bool, keyed_hint: bool):
-            if stego_file_path is None:
+            p = _normalize_file_input(stego_file_path)
+            if not p:
                 return None, None, "Please upload a stego image file."
             try:
-                import pathlib
-                raw_bytes = pathlib.Path(str(stego_file_path)).read_bytes()
+                raw_bytes = pathlib.Path(str(p)).read_bytes()
             except Exception as e:
                 return None, None, f"Error reading file: {e}"
 
-            # Helper to write payload to a temp file for reliable download
             def _to_temp_file(filename: str, data: bytes) -> str:
-                import os
-                suffix = ("_" + filename) if filename else "_output.bin"
-                tmp = NamedTemporaryFile(suffix="_" + filename if filename else "_output.bin", delete=False)
+                tmp = NamedTemporaryFile(suffix="_" + (filename or "output.bin"), delete=False)
                 tmp.write(data); tmp.flush(); tmp.close()
                 return tmp.name
 
-            # Primary attempt
             try:
                 fname, payload = extract_file_from_image(
                     raw_bytes,
@@ -258,47 +302,54 @@ payload_in.change(preview_payload, [payload_in], [payload_preview, payload_info]
                     invert_hint=invert_hint,
                     keyed_hint=keyed_hint,
                 )
-                return fname, _to_temp_file(fname, payload), "Success"
-            except Exception as e1:
-                msg = str(e1)
-                # Helpful guidance for common errors
-                if "InvalidTag" in msg or "MAC check failed" in msg:
-                    return None, None, "Error: Wrong password or corrupted encrypted payload."
-                # Fallback attempts on any failure: try flipped inverted and toggled keyed combos
-                alt_attempts = []
-                alt_attempts.append((not invert_hint, keyed_hint))
-                if password:
-                    alt_attempts.append((invert_hint, not keyed_hint))
-                    alt_attempts.append((not invert_hint, not keyed_hint))
-                    alt_attempts.append((invert_hint, True))
-                    alt_attempts.append((not invert_hint, True))
-                for inv_alt, key_alt in alt_attempts:
-                    try:
-                        fname, payload = extract_file_from_image(
-                            raw_bytes,
-                            password=password if password else None,
-                            invert_hint=inv_alt,
-                            keyed_hint=key_alt,
-                        )
-                        note = " (auto-detected settings used)"
-                        return fname, _to_temp_file(fname, payload), f"Success{note}"
-                    except Exception:
-                        continue
-                return None, None, f"Error: {msg}"
+                path = _to_temp_file(fname, payload)
+                return fname, path, "✅ Success"
+            except Exception as e:
+                return None, None, f"❌ Error: {e}"
 
-        btn2.click(decode_ui2, [stego_path, password2, invert_hint, keyed_hint], [out_name, out_bytes, status2])
+        # Add image preview logic for extracted file
+        def decode_ui2_with_preview(stego_file_path, password: str, invert_hint: bool, keyed_hint: bool):
+            fname, file_path, msg = decode_ui2(stego_file_path, password, invert_hint, keyed_hint)
+            img = None
+            try:
+                if file_path and any(file_path.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".bmp", ".webp"]):
+                    img = Image.open(file_path)
+            except Exception:
+                img = None
+            return fname, file_path, msg, img
 
-        # Diagnose header: read only the header fields without requiring exact keyed/inverted hints
+        btn2.click(
+            decode_ui2_with_preview,
+            [stego_path, password2, invert_hint, keyed_hint],
+            [out_name, out_bytes, status2, extracted_file_preview],
+        )
+        extracted_file_preview.change(lambda x: gr.update(visible=bool(x)), inputs=extracted_file_preview, outputs=extracted_file_preview)
+
+        # Show stego file thumbnail when uploading (if image)
+        def stego_file_preview_fn(stego_file_path):
+            try:
+                fname = _normalize_file_input(stego_file_path)
+                img_exts = [".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"]
+                if fname and any(fname.lower().endswith(e) for e in img_exts):
+                    from PIL import Image
+                    img = Image.open(fname)
+                    return img
+            except Exception:
+                pass
+            return None
+        stego_path.change(stego_file_preview_fn, inputs=stego_path, outputs=stego_file_preview)
+        stego_file_preview.change(lambda x: gr.update(visible=bool(x)), inputs=stego_file_preview, outputs=stego_file_preview)
+
+        # Diagnose header
         def diagnose_header(stego_file_path):
-            if stego_file_path is None:
+            p = _normalize_file_input(stego_file_path)
+            if not p:
                 return "Upload a stego image file first."
             try:
-                import pathlib
-                raw_bytes = pathlib.Path(str(stego_file_path)).read_bytes()
+                raw_bytes = pathlib.Path(str(p)).read_bytes()
             except Exception as e:
                 return f"Error reading file: {e}"
             try:
-                # Header is written sequentially; hints don't matter for header parsing
                 from stego.lsb import decode_lsb
                 info, _ = decode_lsb(raw_bytes, inverted_hint=False, keyed=False, key_material=None)
                 salt_hex = info['salt'].hex() if info.get('salt') else '(none)'
@@ -325,11 +376,11 @@ payload_in.change(preview_payload, [payload_in], [payload_preview, payload_info]
         q_cov = gr.Image(type="pil", image_mode="RGB", sources=["upload"], label="Cover image")
         q_stg = gr.Image(type="pil", image_mode="RGB", sources=["upload"], label="Stego image")
         q_btn = gr.Button("📊 Analyze")
-        q_metrics = gr.Textbox(label="Metrics (PSNR/SSIM/MSE)", interactive=False)
+        q_metrics = gr.Markdown()
         q_hist = gr.Plot(label="Grayscale Histograms")
         q_chi = gr.Plot(label="Chi-square (normalized)")
         q_hot = gr.Image(type="pil", label="Hotspots (highest differences)")
-        q_notes = gr.Textbox(label="Highlights", interactive=False)
+        q_notes = gr.Markdown()
 
         def quality_analyze(cov: Image.Image, stg: Image.Image):
             if cov is None or stg is None:
@@ -374,7 +425,7 @@ payload_in.change(preview_payload, [payload_in], [payload_preview, payload_info]
         t_dct = gr.Image(label="DCT Gray (log-mag)")
         t_wht = gr.Image(label="WHT magnitude (log)")
         t_annot = gr.Image(label="Annotated hotspots (DCT)")
-        t_notes = gr.Textbox(label="Highlights", interactive=False)
+        t_notes = gr.Markdown()
 
         def transforms_compute(img: Image.Image):
             if img is None:
@@ -397,4 +448,52 @@ payload_in.change(preview_payload, [payload_in], [payload_preview, payload_info]
 
 if __name__ == "__main__":
     demo.launch()
+
+# At file end, inject the CSS for a tighter, more visually balanced look
+css_custom = '''
+/* ---- Global spacing ---- */
+.gradio-container { --gap-lg: 10px; --gap-md: 8px; --gap-sm: 6px; }
+.gradio-container .gr-row { gap: var(--gap-lg); align-items: flex-start; }
+.gradio-container .gr-column { gap: var(--gap-md); }
+/* Slightly compact base text rhythm */
+.gradio-container * { line-height: 1.25; }
+
+/* ---- Images (consistent thumbnails) ---- */
+.sm-image { width: 200px; margin: 3px; }
+.sm-image img, .sm-image canvas { max-height: 160px; width: 100%; height: auto; border-radius: 8px; object-fit: contain; }
+.cover-image { width: 220px; }
+.cover-image img, .cover-image canvas { max-height: 180px; width: 100%; height: auto; border-radius: 8px; object-fit: contain; }
+
+/* ---- File inputs and general widths ---- */
+.payload-file, .sm-file { font-size: 0.96em; padding: 4px 8px; width: 240px; }
+
+/* ---- Text inputs ---- */
+.sm-textbox { min-height: 40px; font-size: 1em; border-radius: 6px; }
+
+/* ---- Toggles ---- */
+.sm-checkbox input[type=checkbox] { width: 17px; height: 17px; }
+.sm-radio input[type=radio] { width: 16px; height: 16px; }
+
+/* ---- Buttons ---- */
+.sm-button { padding: 6px 14px; font-size: 1em; border-radius: 7px; }
+
+/* ---- Clean, auto-sized Markdown blocks ---- */
+.sm-md { padding: 6px 8px; background: #fafafa; border-radius: 7px; border: 1px solid #eee; font-size: 1.02em; }
+.sm-md p { margin: 4px 0; }
+
+/* ---- Plots & generic media ---- */
+.gradio-container .gr-plot, .gradio-container .gr-plot * { max-width: 100%; }
+
+/* ---- Row compaction for preview rows ---- */
+.gradio-container .gr-row .sm-image + .sm-image { margin-left: 2px; }
+
+/* ---- Responsive tweaks ---- */
+@media (max-width: 960px) {
+  .sm-image { width: 100%; }
+  .cover-image { width: 100%; }
+  .payload-file, .sm-file { width: 100%; }
+}
+'''
+demo.css += css_custom
+
 
